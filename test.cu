@@ -1,9 +1,20 @@
 #include<stdio.h>
 #include <chrono>
-#define SIZE_CR 512 
+#define SIZE_CR 512
 #define SIZE 1024
 #define SIZE_ODD 1023
+#define ODD2 512
 //__global__ void pcr_odd(float *a,float *b,float *c,float *d,float *rhs,int N);
+__global__ void pcr(float *a,float *b,float *c,float *d,float *rhs,int N);
+#define gpuErrchk(ans) { gpuAssert((ans), __FILE__, __LINE__); }
+inline void gpuAssert(cudaError_t code, const char *file, int line, bool abort=true)
+{
+   if (code != cudaSuccess) 
+   {
+      fprintf(stderr,"GPUassert: %s %s %d\n", cudaGetErrorString(code), file, line);
+      if (abort) exit(code);
+   }
+}
 
 __host__ void thomas(float *a,float *b,float *c,float *d,float *rhs,int N){
     //forward elimination
@@ -12,13 +23,8 @@ __host__ void thomas(float *a,float *b,float *c,float *d,float *rhs,int N){
     b[0]=1.0;
     for(int i=1;i<N;++i){
         float t1=b[i]-c[i-1]*a[i];
-        if(abs(t1)<0.00001){
-            d[i]=d[i]-d[i-1]*a[i];
-        }
-        else{
-            c[i]=c[i]/(t1);
-            d[i]=(d[i]-d[i-1]*a[i])/(t1);
-        }
+        c[i]=c[i]/(t1);
+        d[i]=(d[i]-d[i-1]*a[i])/(t1);
     }
     //backward substitution
     rhs[N-1]=d[N-1];
@@ -227,7 +233,7 @@ void test_64_cr(){
     cudaMemcpy(b_gpu,b,D*sizeof(float),cudaMemcpyHostToDevice);
     cudaMemcpy(c_gpu,c,D*sizeof(float),cudaMemcpyHostToDevice);
     cudaMemcpy(d_gpu,d,D*sizeof(float),cudaMemcpyHostToDevice);
-    cr<<<1,32>>>(a_gpu,b_gpu,c_gpu,d_gpu,rhs,D);
+    pcr<<<2,32>>>(a_gpu,b_gpu,c_gpu,d_gpu,rhs,D);
     float *ans=(float*)malloc(D*sizeof(float));
 
     cudaMemcpy(ans,rhs,D*sizeof(float),cudaMemcpyDeviceToHost);
@@ -239,10 +245,12 @@ void test_64_cr(){
     cudaFree(rhs);
 }
 
+
+
 __global__ void pcr(float *a,float *b,float *c,float *d,float *rhs,int N){
-    __shared__ float a_i[SIZE];    __shared__ float b_i[SIZE];
-    __shared__ float c_i[SIZE];    __shared__ float d_i[SIZE];
-    int i=threadIdx.x;
+    __shared__ float a_i[SIZE_CR];    __shared__ float b_i[SIZE_CR];
+    __shared__ float c_i[SIZE_CR];    __shared__ float d_i[SIZE_CR];
+    int i=2*threadIdx.x+blockIdx.x;
     float k1=i==0?0.0:a[i]/b[i-1],k2;
 
     // First reduction (first step)
@@ -250,34 +258,33 @@ __global__ void pcr(float *a,float *b,float *c,float *d,float *rhs,int N){
         k2=c[i]/b[i+1];}
     else{k2=0.0;}
 
-
     if(i==0){ // specific case (first equation)
-        b_i[i]=b[i]-a[i+1]*k2;
-        c_i[i]=-c[i+1]*k2;
-        d_i[i]=d[i]-d[i+1]*k2;
-        a_i[i]=0.0;
+        b_i[threadIdx.x]=b[i]-a[i+1]*k2;
+        c_i[threadIdx.x]=-c[i+1]*k2;
+        d_i[threadIdx.x]=d[i]-d[i+1]*k2;
+        a_i[threadIdx.x]=0.0;
     }
     else if(i==N-1){ // specific case (last equation)
-        a_i[i]=-a[i-1]*k1;
-        b_i[i]=b[i]-c[i-1]*k1;
-        c_i[i]=0.0;
-        d_i[i]=d[i]-d[i-1]*k1;
+        a_i[threadIdx.x]=-a[i-1]*k1;
+        b_i[threadIdx.x]=b[i]-c[i-1]*k1;
+        c_i[threadIdx.x]=0.0;
+        d_i[threadIdx.x]=d[i]-d[i-1]*k1;
     }
     else{ // general case
-        a_i[i]=-a[i-1]*k1;
-        b_i[i]=b[i]-c[i-1]*k1-a[i+1]*k2;
-        c_i[i]=-c[i+1]*k2;
-        d_i[i]=d[i]-d[i-1]*k1-d[i+1]*k2;
+        a_i[threadIdx.x]=-a[i-1]*k1;
+        b_i[threadIdx.x]=b[i]-c[i-1]*k1-a[i+1]*k2;
+        c_i[threadIdx.x]=-c[i+1]*k2;
+        d_i[threadIdx.x]=d[i]-d[i-1]*k1-d[i+1]*k2;
     }
-    //printf("Phase1 check\nI: %d k1: %f  k2: %f\n a[i]: %f   b[i] : %f   c[i] : %f   d[i] : %f   \n\n",i,k1,k2,a_i[i],b_i[i],c_i[i],d_i[i]);
+    //printf("Phase1 check\nI: %d threadIdx.x: %d  blockIdx.x: %d k1: %f  k2: %f\n a[i]: %f   b[i] : %f   c[i] : %f   d[i] : %f   \n\n",i,threadIdx.x,blockIdx.x,k1,k2,a_i[threadIdx.x],b_i[threadIdx.x],c_i[threadIdx.x],d_i[threadIdx.x]);
     __syncthreads();
-    int coeff=2; //stride for correspondance between thread and equation
+    int coeff=1; //stride for correspondance between thread and equation
     float ta;
     float tb;
     float tc;
     float td;
-
-
+    //printf("before loop %d\n",threadIdx.x);
+    i=threadIdx.x;
     while(coeff<N/2){  // stop when coeff is half of SIZE (log2(N)-1 iterations) 
         if(i-coeff<0){ // specific case (first equation of the system/subsystem)
             k1=0.0;
@@ -286,13 +293,15 @@ __global__ void pcr(float *a,float *b,float *c,float *d,float *rhs,int N){
             tc=-c_i[i+coeff]*k2;
             td=d_i[i]-d_i[i+coeff]*k2;
             ta=0.0;
+            //printf("loop1 check\nI: %d threadIdx.x: %d  blockIdx.x: %d k1: %f  k2: %f\n a[i]: %f   b[i] : %f   c[i] : %f   d[i] : %f   \n\n",i,threadIdx.x,blockIdx.x,k1,k2,a_i[threadIdx.x],b_i[threadIdx.x],c_i[threadIdx.x],d_i[threadIdx.x]);
         }
-        else if(i+coeff>N-1){ // specific case (last equation of the system/subsystem)
+        else if(i+coeff>SIZE_CR-1){ // specific case (last equation of the system/subsystem)
             k1=a_i[i]/b_i[i-coeff];
             ta=-a_i[i-coeff]*k1;
             tb=b_i[i]-c_i[i-coeff]*k1;
             tc=0.0;
             td=d_i[i]-d_i[i-coeff]*k1;
+            //printf("loop2  check\nI: %d threadIdx.x: %d  blockIdx.x: %d k1: %f  k2: %f\n a[i]: %f   b[i] : %f   c[i] : %f   d[i] : %f   \n\n",i,threadIdx.x,blockIdx.x,k1,k2,a_i[threadIdx.x],b_i[threadIdx.x],c_i[threadIdx.x],d_i[threadIdx.x]);
         }
         else{ // general case
             k1=a_i[i]/b_i[i-coeff];
@@ -301,6 +310,7 @@ __global__ void pcr(float *a,float *b,float *c,float *d,float *rhs,int N){
             tb=b_i[i]-c_i[i-coeff]*k1-a_i[i+coeff]*k2;
             tc=-c_i[i+coeff]*k2;
             td=d_i[i]-d_i[i-coeff]*k1-d_i[i+coeff]*k2;
+            //printf("loop3  check\nI: %d threadIdx.x: %d  blockIdx.x: %d k1: %f  k2: %f\n a[i]: %f   b[i] : %f   c[i] : %f   d[i] : %f   \n\n",i,threadIdx.x,blockIdx.x,k1,k2,a_i[threadIdx.x],b_i[threadIdx.x],c_i[threadIdx.x],d_i[threadIdx.x]);
         }
         __syncthreads(); // the first synchronization of threads is to avoid the situation that the other threads use the modified coefficients prepared for the next phase of iteration
         a_i[i]=ta;
@@ -308,15 +318,12 @@ __global__ void pcr(float *a,float *b,float *c,float *d,float *rhs,int N){
         c_i[i]=tc;
         d_i[i]=td;
         __syncthreads(); // the second synchr11onization is to avoid that some threads commence the next phase with vectors unupdated
+        //printf("\nIN LOOPIdx: thread : %d block: %d k1: %f  k2: %f\n a[i]: %f   b[i] : %f   c[i] : %f   d[i] : %f   \n",threadIdx.x,blockIdx.x,k1,k2,a_i[i],b_i[i],c_i[i],d_i[i]);
         coeff*=2; //augmentation of the amount of stride
     }
     //solution phase
-    //rhs[i]=d_i[i]/b_i[i];
-    if(i<N/2){
-        k2=b_i[i+coeff]==0.0?0.0:c_i[i]/b_i[i+coeff];
-        rhs[i]=(d_i[i]-d_i[i+coeff]*k2)/(b_i[i]-a_i[i+coeff]*k2);
-        rhs[i+coeff]=(d_i[i+coeff]-a_i[coeff+i]*rhs[i])/b_i[i+coeff];
-    }
+    //printf("loop out\n");
+    rhs[2*threadIdx.x+blockIdx.x]=d_i[i]/b_i[i];
 }
 /*
 void test_64_pcr(){
@@ -384,7 +391,7 @@ __global__ void pcr_odd(float *a,float *b,float *c,float *d,float *rhs,int N){
     __shared__ float c_i[SIZE_ODD];    __shared__ float d_i[SIZE_ODD];
     int i=threadIdx.x;
     float k1=i==0?0.0:a[i]/b[i-1],k2;
-    int M_2_exp=2; // the greater power of two striclty inferior to N
+    int M_2_exp=2; // the greatest power of two striclty inferior to N
 
     while(M_2_exp<N){
         M_2_exp*=2;
@@ -414,7 +421,7 @@ __global__ void pcr_odd(float *a,float *b,float *c,float *d,float *rhs,int N){
         c_i[i]=-c[i+1]*k2;
         d_i[i]=d[i]-d[i-1]*k1-d[i+1]*k2;
     }
-    //printf("Phase1 check\nI: %d k1: %f  k2: %f\n a[i]: %f   b[i] : %f   c[i] : %f   d[i] : %f   \n\n",i,k1,k2,a_i[i],b_i[i],c_i[i],d_i[i]);
+    printf("Phase1 check\nI: %d k1: %f  k2: %f\n a[i]: %f   b[i] : %f   c[i] : %f   d[i] : %f   \n\n",i,k1,k2,a_i[i],b_i[i],c_i[i],d_i[i]);
     __syncthreads();
     int coeff=2; //stride beginning from the second phase of forward substitution
     float ta;
@@ -453,7 +460,9 @@ __global__ void pcr_odd(float *a,float *b,float *c,float *d,float *rhs,int N){
         c_i[i]=tc;
         d_i[i]=td;
         __syncthreads();
+        printf("\nIN LOOPIdx: thread : %d k1: %f  k2: %f\n a[i]: %f   b[i] : %f   c[i] : %f   d[i] : %f   \n",threadIdx.x,k1,k2,a_i[i],b_i[i],c_i[i],d_i[i]);
         coeff*=2; //augmentation of the stride
+
     }
     //solution phase // normally most systems left are equations of 1 unknown since the problem size is not 2^p (p={1,2,3,...}) there will be equations of 3 or 2 unknows left
     //We find these systems not reduced to 1 unknown and find the solutions according to their indexes of the systems
@@ -474,9 +483,119 @@ __global__ void pcr_odd(float *a,float *b,float *c,float *d,float *rhs,int N){
         // Cases where there is only one unknown left
         rhs[i]=d_i[i]/b_i[i];
     }
+    
 }
 
-
+__global__ void pcr_odd2(float *a,float *b,float *c,float *d,float *rhs,int N){
+    __shared__ float a_i[ODD2];    __shared__ float b_i[ODD2];
+    __shared__ float c_i[ODD2];    __shared__ float d_i[ODD2];
+    int i=2*threadIdx.x+blockIdx.x;
+    // First reduction (first step)
+    float k1=i==0?0.0:a[i]/b[i-1];
+    float k2=((i==N-1)||(i==N))?0.0:c[i]/b[i+1];
+    int M_2_exp=2; // the greatest power of two striclty inferior to N
+    while(M_2_exp<N){
+        M_2_exp*=2;
+    }
+    M_2_exp/=2;
+    if(i==N){
+        b_i[threadIdx.x]=0.0;
+        c_i[threadIdx.x]=0.0;
+        d_i[threadIdx.x]=0.0;
+        a_i[threadIdx.x]=0.0;
+    }
+    else if(i==0){ // specific case (first equation)
+        b_i[threadIdx.x]=b[i]-a[i+1]*k2;
+        c_i[threadIdx.x]=-c[i+1]*k2;
+        d_i[threadIdx.x]=d[i]-d[i+1]*k2;
+        a_i[threadIdx.x]=0.0;
+        
+    }
+    else if(i==N-1){ // specific case (last equation)
+        a_i[threadIdx.x]=-a[i-1]*k1;
+        b_i[threadIdx.x]=b[i]-c[i-1]*k1;
+        c_i[threadIdx.x]=0.0;
+        d_i[threadIdx.x]=d[i]-d[i-1]*k1;
+    }
+    else{ // general case
+        a_i[threadIdx.x]=-a[i-1]*k1;
+        b_i[threadIdx.x]=b[i]-c[i-1]*k1-a[i+1]*k2;
+        c_i[threadIdx.x]=-c[i+1]*k2;
+        d_i[threadIdx.x]=d[i]-d[i-1]*k1-d[i+1]*k2;
+    }
+    //printf("Phase1 check1\nI: %d threadIdx.x: %d  blockIdx.x: %d k1: %f  k2: %f\n a[i]: %f   b[i] : %f   c[i] : %f   d[i] : %f   \n\n",i,threadIdx.x,blockIdx.x,k1,k2,a_i[threadIdx.x],b_i[threadIdx.x],c_i[threadIdx.x],d_i[threadIdx.x]);
+    //printf("Phase1 check\nI: %d threadIdx.x: %d  blockIdx.x: %d k1: %f  k2: %f\n a[i]: %f   b[i] : %f   c[i] : %f   d[i] : %f   \n\n",i,threadIdx.x,blockIdx.x,k1,k2,a_i[threadIdx.x],b_i[threadIdx.x],c_i[threadIdx.x],d_i[threadIdx.x]);
+    __syncthreads();
+    int coeff=1; //stride for correspondance between thread and equation
+    float ta;
+    float tb;
+    float tc;
+    float td;
+    //printf("before loop %d\n",threadIdx.x);
+    i=threadIdx.x;
+    if(ODD2%2){M_2_exp/=2;}
+    while(coeff<M_2_exp){  // stop when coeff is half of SIZE (log2(N)-1 iterations)
+        if(2*i+blockIdx.x!=N){
+            if(i-coeff<0){ // specific case (first equation of the system/subsystem)
+                k1=0.0;
+                k2=c_i[i]/b_i[i+coeff];
+                tb=b_i[i]-a_i[i+coeff]*k2;
+                tc=-c_i[i+coeff]*k2;
+                td=d_i[i]-d_i[i+coeff]*k2;
+                ta=0.0;
+                //printf("loop1 check\nI: %d threadIdx.x: %d  blockIdx.x: %d k1: %f  k2: %f\n a[i]: %f   b[i] : %f   c[i] : %f   d[i] : %f   \n\n",i,threadIdx.x,blockIdx.x,k1,k2,a_i[threadIdx.x],b_i[threadIdx.x],c_i[threadIdx.x],d_i[threadIdx.x]);
+            }
+            else if(i+coeff>ODD2-1||(i+coeff==ODD2-1)&&(b_i[ODD2-1]==0.0)){ // specific case (last equation of the system/subsystem)
+                k1=a_i[i]/b_i[i-coeff];
+                ta=-a_i[i-coeff]*k1;
+                tb=b_i[i]-c_i[i-coeff]*k1;
+                tc=0.0;
+                td=d_i[i]-d_i[i-coeff]*k1;
+                //printf("loop2  check\nI: %d threadIdx.x: %d  blockIdx.x: %d k1: %f  k2: %f\n a[i]: %f   b[i] : %f   c[i] : %f   d[i] : %f   \n\n",i,threadIdx.x,blockIdx.x,k1,k2,a_i[threadIdx.x],b_i[threadIdx.x],c_i[threadIdx.x],d_i[threadIdx.x]);
+            }
+            else{ // general case
+                k1=a_i[i]/b_i[i-coeff];
+                k2=c_i[i]/b_i[i+coeff];
+                ta=-a_i[i-coeff]*k1;
+                tb=b_i[i]-c_i[i-coeff]*k1-a_i[i+coeff]*k2;
+                tc=-c_i[i+coeff]*k2;
+                td=d_i[i]-d_i[i-coeff]*k1-d_i[i+coeff]*k2;
+                //printf("loop3  check\nI: %d threadIdx.x: %d  blockIdx.x: %d k1: %f  k2: %f\n a[i]: %f   b[i] : %f   c[i] : %f   d[i] : %f   \n\n",i,threadIdx.x,blockIdx.x,k1,k2,a_i[threadIdx.x],b_i[threadIdx.x],c_i[threadIdx.x],d_i[threadIdx.x]);
+            }
+            __syncthreads(); // the first synchronization of threads is to avoid the situation that the other threads use the modified coefficients prepared for the next phase of iteration
+            a_i[i]=ta;
+            b_i[i]=tb;
+            c_i[i]=tc;
+            d_i[i]=td;
+            __syncthreads(); // the second synchr11onization is to avoid that some threads commence the next phase with vectors unupdated
+            //printf("\nIN LOOPIdx: thread : %d block: %d k1: %f  k2: %f\n a[i]: %f   b[i] : %f   c[i] : %f   d[i] : %f   \n",threadIdx.x,blockIdx.x,k1,k2,a_i[i],b_i[i],c_i[i],d_i[i]);
+        }
+        coeff*=2; //augmentation of the amount of stride
+    }
+    //solution phase
+    //printf("loop out\n");
+    //printf("\nloop out: thread : %d block: %d k1: %f  k2: %f\n a[i]: %f   b[i] : %f   c[i] : %f   d[i] : %f   \n",threadIdx.x,blockIdx.x,k1,k2,a_i[i],b_i[i],c_i[i],d_i[i]);
+    if(2*threadIdx.x+blockIdx.x!=N){
+        //if(blockIdx.x==1){printf("where???????????????????????,\n");}
+        if( abs(a_i[i])>0.00001 || abs(c_i[i])>0.00001 ){
+            if(i+coeff<N&&i-coeff<0){
+                //the first half of the systems,from 0 to N/2-1
+                k2=b_i[i+coeff]==0.0?0.0:c_i[i]/b_i[i+coeff];
+                rhs[2*i+blockIdx.x]=(d_i[i]-d_i[i+coeff]*k2)/(b_i[i]-a_i[i+coeff]*k2);
+            }
+            else if(i-coeff>=0){
+                // the second half of the systems, from N/2 to N-1
+                k2=b_i[i-coeff]==0.0?0.0:a_i[i]/b_i[i-coeff];
+                rhs[2*i+blockIdx.x]=(d_i[i]-d_i[i-coeff]*k2)/(b_i[i]-c_i[i-coeff]*k2);
+            }
+        }
+        else{
+            // Cases where there is only one unknown left
+            rhs[2*i+blockIdx.x]=d_i[i]/b_i[i];
+        }
+        //printf("\nsolution phase: thread : %d block: %d sol : %f\n",threadIdx.x,blockIdx.x,rhs[i]);
+    }
+}
 /*
 void test_10_pcrodd(){
     int D=10;
@@ -505,6 +624,8 @@ void test_10_pcrodd(){
     cudaFree(a_gpu);    cudaFree(b_gpu);    cudaFree(c_gpu);    cudaFree(d_gpu);
     cudaFree(rhs);
 }*/
+
+/*
 void test_512_all(){
     int D=512; //dimensions of our problem
     //rhs=(float*)malloc(d*sizeof(float));
@@ -564,14 +685,14 @@ void test_512_all(){
     for(int i=0;i<D;++i){
         ans[i]=0.0;
     }
-    */
+    
 
     printf("\nRun time elapsed on GPU, Cyclic Reduction: %f millisecondes\n", temps_ecoule);
     temps_ecoule=0.0;
     
     cudaMemcpy(rhs,ans,D*sizeof(float),cudaMemcpyHostToDevice); // reinitialise all the solutions values to zero
     cudaEventRecord(start, 0);
-	pcr<<<1,SIZE>>>(a_gpu,b_gpu,c_gpu,d_gpu,rhs,D);
+	pcr<<<2,SIZE_CR>>>(a_gpu,b_gpu,c_gpu,d_gpu,rhs,D);
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
 	cudaEventElapsedTime(&temps_ecoule, start, stop);
@@ -608,7 +729,7 @@ void test_512_all(){
         if(i>0&&i%24==0){
             printf("\n");
         }
-    }*/
+    }
 
     cudaFree(a_gpu);    cudaFree(b_gpu);    cudaFree(c_gpu);    cudaFree(d_gpu);
     cudaFree(rhs);
@@ -655,13 +776,73 @@ void test_512_all(){
         if(i>0&&i%24==0){
             printf("\n");
         }
-    }*/
+    }
     
     free(ans);
     cudaFree(a_g);    cudaFree(b_g);    cudaFree(c_g);    cudaFree(d_g);
     cudaFree(rhs_);
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
+}
+*/
+void test_128_pcr(){
+    int D=128; //dimensions of our problem
+    //rhs=(float*)malloc(d*sizeof(float));
+    float a[128];
+    float b[128];
+    float c[128];
+    float d[128];
+    a[0]=0.0;   a[127]=-1.0;
+    b[0]=2.0;   b[127]=2.0;
+    c[0]=-1.0;  c[127]=0.0;
+    d[0]=1.0;   d[127]=1.0;
+    for(int i=1;i<127;++i){
+        a[i]=-1.0;
+        b[i]=2.0;
+        c[i]=-1.0;
+        d[i]=1.0;
+    }
+
+
+    float *a_gpu,*b_gpu,*c_gpu,*d_gpu;
+    float *rhs;
+    cudaMalloc(&rhs,D*sizeof(float));
+    cudaMalloc(&a_gpu,D*sizeof(float));
+    cudaMalloc(&b_gpu,D*sizeof(float));
+    cudaMalloc(&c_gpu,D*sizeof(float));
+    cudaMalloc(&d_gpu,D*sizeof(float));
+    cudaMemcpy(a_gpu,a,D*sizeof(float),cudaMemcpyHostToDevice);
+    cudaMemcpy(b_gpu,b,D*sizeof(float),cudaMemcpyHostToDevice);
+    cudaMemcpy(c_gpu,c,D*sizeof(float),cudaMemcpyHostToDevice);
+    cudaMemcpy(d_gpu,d,D*sizeof(float),cudaMemcpyHostToDevice);
+    
+
+    float temps_ecoule=0.0;
+    cudaEvent_t start, stop;
+	cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, 0);
+    pcr<<<2,SIZE_CR>>>(a_gpu,b_gpu,c_gpu,d_gpu,rhs,D);
+    //gpuErrchk( cudaPeekAtLastError() );
+    //gpuErrchk( cudaDeviceSynchronize() );
+	cudaEventRecord(stop, 0);
+	cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&temps_ecoule, start, stop);
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    printf("\nRun time elapsed on GPU, Parallel Cyclic Reduction: %f millisecondes\n", temps_ecoule);
+    float *ans=(float*)malloc(D*sizeof(float));
+    cudaMemcpy(ans,rhs,D*sizeof(float),cudaMemcpyDeviceToHost);
+    
+    for(int i=0;i<D;++i){
+        printf("X%d = %f ",i+1,*(ans+i));
+        if(i>0&&i%10==0){
+            printf("\n");
+        }
+    }
+    cudaFree(a_gpu);    cudaFree(b_gpu);    cudaFree(c_gpu);    cudaFree(d_gpu);
+    cudaFree(rhs);
+    free(ans);
 }
 
 void test_1024_all(){
@@ -703,14 +884,15 @@ void test_1024_all(){
     cudaEventRecord(start, 0);
 	cr<<<1,SIZE_CR>>>(a_gpu,b_gpu,c_gpu,d_gpu,rhs,D);
 	cudaEventRecord(stop, 0);
-	cudaEventSynchronize(stop);
+    cudaEventSynchronize(stop);
     cudaEventElapsedTime(&temps_ecoule, start, stop);
     float *ans=(float*)malloc(D*sizeof(float));
     for(int i=0;i<D;++i){
         ans[i]=0.0;
     }
-    cudaMemcpy(ans,rhs,D*sizeof(float),cudaMemcpyDeviceToHost);
     /*
+    cudaMemcpy(ans,rhs,D*sizeof(float),cudaMemcpyDeviceToHost);
+    
     // all this part is to verify the solution of CR algorithm
     printf("CR algorithm answer:\n\n");
     
@@ -725,17 +907,20 @@ void test_1024_all(){
     }
     */
 
-    printf("\nRun time elapsed on GPU, Cyclic Reduction: %f millisecondes\n", temps_ecoule);
+    printf("\nRun time elapsed on GPU, Cyclic Reduction: %f microsecondes\n", 1000*temps_ecoule);
     temps_ecoule=0.0;
     
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
     cudaMemcpy(rhs,ans,D*sizeof(float),cudaMemcpyHostToDevice); // reinitialise all the solutions values to zero
-    cudaEventRecord(start, 0);
-	pcr<<<1,SIZE>>>(a_gpu,b_gpu,c_gpu,d_gpu,rhs,D);
-    cudaEventRecord(stop, 0);
-    cudaEventSynchronize(stop);
-	cudaEventElapsedTime(&temps_ecoule, start, stop);
-    printf("\nRun time elapsed on GPU, Parallel Cyclic Reduction: %f millisecondes\n", temps_ecoule);
-
+    
+    auto t_start = std::chrono::high_resolution_clock::now();
+    pcr<<<2,SIZE_CR>>>(a_gpu,b_gpu,c_gpu,d_gpu,rhs,D);
+    //cudaDeviceSynchronize();
+    auto t_end = std::chrono::high_resolution_clock::now();
+    temps_ecoule = std::chrono::duration<float, std::micro>(t_end-t_start).count();
+    printf("\nRun time elapsed on GPU, Parallel Cyclic Reduction: %f microsecondes\n", temps_ecoule);
+    
     /*
     // all this part is to verify the solution of pcr algorithm
     cudaMemcpy(ans,rhs,D*sizeof(float),cudaMemcpyDeviceToHost);
@@ -752,12 +937,13 @@ void test_1024_all(){
         ans[i]=0.0;
     }*/
     
+    
 
-    auto t_start = std::chrono::high_resolution_clock::now();
+    t_start = std::chrono::high_resolution_clock::now();
     thomas(a,b,c,d,ans,D);
-    auto t_end = std::chrono::high_resolution_clock::now();
-    temps_ecoule = std::chrono::duration<float, std::milli>(t_end-t_start).count();
-    printf("\nRun time elapsed on CPU, Thomas Method: %f millisecondes\n", temps_ecoule);
+    t_end = std::chrono::high_resolution_clock::now();
+    temps_ecoule = std::chrono::duration<float, std::micro>(t_end-t_start).count();
+    printf("\nRun time elapsed on CPU, Thomas Method: %f microsecondes\n", temps_ecoule);
     //printf("\nThomas algorithm run time : %g milliseconds\n",elapsed_time_ms);
 
     /* //verify thomas algorithm answer
@@ -788,6 +974,7 @@ void test_1024_all(){
     }
     float *a_g,*b_g,*c_g,*d_g;
     float *rhs_;
+    float *a2=(float*)malloc(D*sizeof(float));
     cudaMalloc(&rhs_,D*sizeof(float));
     cudaMalloc(&a_g,D*sizeof(float));
     cudaMalloc(&b_g,D*sizeof(float));
@@ -797,30 +984,28 @@ void test_1024_all(){
     cudaMemcpy(b_g,b_,D*sizeof(float),cudaMemcpyHostToDevice);
     cudaMemcpy(c_g,c_,D*sizeof(float),cudaMemcpyHostToDevice);
     cudaMemcpy(d_g,d_,D*sizeof(float),cudaMemcpyHostToDevice);
-
     temps_ecoule=0.0;
-    cudaEventRecord(start, 0);
-	pcr_odd<<<1,SIZE_ODD>>>(a_g,b_g,c_g,d_g,rhs_,D);
-	cudaEventRecord(stop, 0);
-	cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&temps_ecoule, start, stop);
-    printf("\nRun time elapsed on GPU, Algorithm Parallel Reduction Cyclique With ODD SIZE: %f millisecondes\n", temps_ecoule);
-
-    /* //verifiy pcr_odd answer
+    t_start = std::chrono::high_resolution_clock::now();
+    pcr_odd2<<<2,ODD2>>>(a_g,b_g,c_g,d_g,rhs_,D);
+    t_end = std::chrono::high_resolution_clock::now();
+    temps_ecoule = std::chrono::duration<float, std::micro>(t_end-t_start).count();
+    printf("\nRun time elapsed on GPU, Algorithm Parallel Reduction Cyclique With ODD SIZE: %f microsecondes\n", temps_ecoule);
+    /*
+     //verifiy pcr_odd answer
     cudaMemcpy(ans,rhs,D*sizeof(float),cudaMemcpyDeviceToHost);
-    printf("PCR algorithm answer:\n\n");
+    thomas(a_,b_,c_,d_,a2,D);
+    
+    printf("PCR ODD algorithm answer:\n\n");
     for(int i=0;i<D;++i){
-        printf("X%d = %f ",i+1,*(ans+i));
-        if(i>0&&i%24==0){
+        printf("X%d = %f %f ",i+1,*(ans+i),a2[i]);
+        if(i>0&&i%4==0){
             printf("\n");
         }
     }*/
     
-    free(ans);
+    free(ans);  free(a2);
     cudaFree(a_g);    cudaFree(b_g);    cudaFree(c_g);    cudaFree(d_g);
     cudaFree(rhs_);
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
 }
 
 int main(){
@@ -848,14 +1033,10 @@ int main(){
     
     /*
     test_64_cr();
-    printf("check err64\n");
-
+    printf("check err64\n");*/
+/*
     test_64_pcr();
     printf("normally out pcr64\n");*/
-
-    /*
-    test_10_pcrodd();
-    printf("all out\n");*/
 
     test_1024_all();
     return 0;
@@ -906,4 +1087,7 @@ int main(){
   252.0000
   228.0000
   203.0000
-  177.0000 150.0000 122.0000 93.0000 63.0000 32.0000*/
+  177.0000 150.0000 122.0000 93.0000 63.0000 32.0000
+
+  
+  */
